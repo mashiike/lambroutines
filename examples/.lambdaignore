@@ -1,0 +1,6 @@
+main.go
+function.jsonnet
+Taskfile.yml
+.lambdaignore
+aqua.yaml
+*.zip

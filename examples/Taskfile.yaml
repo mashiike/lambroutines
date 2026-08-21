@@ -1,0 +1,37 @@
+version: '3'
+
+tasks:
+  default:
+    desc: default-task
+    cmds:
+      - task --list
+  build:
+    dir: ..
+    env:
+      GOOS: linux
+      GOARCH: arm64
+      CGO_ENABLED: "0"
+    cmds:
+      - go build -o examples/bootstrap ./examples
+  
+  dry-run:
+    desc: deploy lambda function (dry run)
+    cmds:
+      - task: build
+      - aqua exec -- lambroll deploy --src . --dry-run
+  deploy:
+    desc: deploy lambda function
+    cmds:
+      - task: build
+      - aqua exec -- lambroll deploy --src .
+  invoke:
+    desc: invoke function
+    cmds:
+      - echo '{}' | lambroll invoke --log-tail
+  logs:
+    desc: tail logs
+    cmds:
+      - aqua exec -- lambroll logs --follow
+  clean:
+    cmds:
+      - rm -f bootstrap
