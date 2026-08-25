@@ -4,7 +4,7 @@
 
 ## プロジェクト概要
 
-`lambroutines` は、AWS Lambda の handler から素の `go fn()` と同じ感覚でバックグラウンド処理を起動しつつ、その処理が完了するまで実行環境がフリーズしないことを保証する Go パッケージ。internal Lambda extension を登録し、handler 完了 + `Go()` で起動した処理の完了の両方を確認してから extension 自身の `/next` 呼び出しを行うことで実現している。Lambda 実行環境外(`fujiwara/lamblocal` 配下や `go run` 等)ではローカルモードにフォールバックする。
+`lambroutines` は、AWS Lambda の handler から素の `go fn()` と同じ感覚でバックグラウンド処理を起動しつつ、その処理が完了するまで実行環境がフリーズしないことを保証する Go パッケージ。internal Lambda extension を登録し、invocation ごとに開始される `Scope` の終了 + その `Scope` 経由で `Go()` を呼んで起動した処理の完了の両方を確認してから extension 自身の `/next` 呼び出しを行うことで実現している。`Wrap` は `lambda.Handler` を受け取るハンドラ向けに `Scope` の開始・終了を自動化する薄いラッパーで、`fujiwara/ridge` のように `lambda.Start` を内部で直接呼んでしまう統合には `StartScope` を直接使う。Lambda 実行環境外(`fujiwara/lamblocal` 配下や `go run` 等)ではローカルモードにフォールバックする。
 
 詳細は [README.md](README.md) / [README.ja.md](README.ja.md) を参照。
 
@@ -37,9 +37,10 @@ lint は `golangci-lint`(CI と同一設定)を使う。ローカルに無けれ
 
 ## 設計上の重要な制約
 
-- `(*Extension).Go(fn)` は**呼ばれた瞬間に即座に goroutine を起動する**(呼び出し側から見て素の `go fn()` と同じ見た目)。「handler 完了まで開始を遅延する」ような変更は設計の核を破壊する
-- ローカルモードとLambda実行時で `Go()`/`Wrap()`/`ExtensionFromContext` の外部から見える挙動は同一に保つ(内部の待ち合わせ方法だけが異なる)
-- `handlerCompleted()` と `inflight` の待ち合わせに monotonic counter (`completions`/`inflight` + `sync.Cond`) を使っている理由、ローカルモードで `Go()` 自体を分岐させない理由は `.claude/rules/completion-tracking.md` を参照。変更前に必ず読むこと
+- `(*Scope).Go(fn)` は**呼ばれた瞬間に即座に goroutine を起動する**(呼び出し側から見て素の `go fn()` と同じ見た目)。「invocation 完了まで開始を遅延する」ような変更は設計の核を破壊する
+- ローカルモードとLambda実行時で `Go()`/`Wrap()`/`StartScope()`/`ScopeFromContext` の外部から見える挙動は同一に保つ(内部の待ち合わせ方法だけが異なる)
+- nested `Scope`(既に `Scope` を含む `ctx` から `StartScope` を呼んだ場合)は root `Scope` の `inflight` に合算されるだけで、独立した完了通知を持たない。`End()` は root でのみ意味を持ち、冪等(`sync.Once`)。この非対称性を「nested にも通知させる」方向へ変更しない
+- `WithScopeTimeout` は `Scope` が**開始**されるまでの猶予であり、`Scope` の**終了**(`completions`)を待つ側にタイムアウトを付けてはならない。終了側に付けると、猶予時間を超える正常な handler で誤警告・恒久的なズレが起きる(設計中に実際にこの誤りを作った実績がある)。理由・待ち合わせの詳細は `.claude/rules/completion-tracking.md` を参照。変更前に必ず読むこと
 - `examples/main.go` の handler 内の sleep は実機での動作検証用の意図的なコードで、削除・変更禁止。理由は `.claude/rules/example-handler-timing.md` を参照
 
 ## テスト方針

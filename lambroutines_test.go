@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,7 +20,7 @@ import (
 // event/next blocks until the test sends an event type on respond, and
 // reports each poll on polled so the test can observe when loop() advances.
 type fakeExtensionsAPI struct {
-	polled  chan struct{}
+	polled  chan time.Time
 	respond chan string
 
 	// registeredExtensionName is written by the register handler before it
@@ -30,7 +32,7 @@ type fakeExtensionsAPI struct {
 
 func newFakeExtensionsAPI() *fakeExtensionsAPI {
 	return &fakeExtensionsAPI{
-		polled:  make(chan struct{}),
+		polled:  make(chan time.Time),
 		respond: make(chan string),
 	}
 }
@@ -44,7 +46,7 @@ func (f *fakeExtensionsAPI) handler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]any{})
 	})
 	mux.HandleFunc("/2020-01-01/extension/event/next", func(w http.ResponseWriter, r *http.Request) {
-		f.polled <- struct{}{}
+		f.polled <- time.Now()
 		eventType := <-f.respond
 		_ = json.NewEncoder(w).Encode(map[string]string{"eventType": eventType})
 	})
@@ -69,34 +71,34 @@ func newTestExtension(t *testing.T, opts ...Option) (*Extension, *fakeExtensions
 	return e, api
 }
 
-// awaitPoll waits for loop() to reach its next /next call, failing the test
-// if it doesn't happen in time. It distinguishes "loop() advanced" from
-// "loop() is stuck waiting on a stale completion signal".
-func awaitPoll(t *testing.T, api *fakeExtensionsAPI) {
+func awaitPoll(t *testing.T, api *fakeExtensionsAPI) time.Time {
 	t.Helper()
 	select {
-	case <-api.polled:
+	case ts := <-api.polled:
+		return ts
 	case <-time.After(2 * time.Second):
 		t.Fatal("loop() never issued the next event/next call")
+		return time.Time{}
 	}
 }
 
 func TestExtension_HandlerCompletesBeforeExtensionDeliversInvoke(t *testing.T) {
 	e, api := newTestExtension(t)
 
-	awaitPoll(t, api) // initial poll right after registration
+	awaitPoll(t, api)
 
+	scope, _ := e.StartScope(context.Background())
 	var bgDone atomic.Bool
-	e.Go(func(context.Context) error {
+	scope.Go(func(context.Context) error {
 		time.Sleep(100 * time.Millisecond)
 		bgDone.Store(true)
 		return nil
 	})
-	e.handlerCompleted() // handler returns before the extension even sees INVOKE
+	scope.End()
 
 	api.respond <- "INVOKE"
 
-	awaitPoll(t, api) // loop() must still notice completion and wait for inflight work
+	awaitPoll(t, api)
 	if !bgDone.Load() {
 		t.Error("loop() polled again before the background task finished")
 	}
@@ -107,17 +109,18 @@ func TestExtension_ExtensionSeesInvokeBeforeHandlerCompletes(t *testing.T) {
 	e, api := newTestExtension(t)
 
 	awaitPoll(t, api)
-	api.respond <- "INVOKE" // loop() now waits for a completion that hasn't happened yet
+	api.respond <- "INVOKE"
 
-	time.Sleep(50 * time.Millisecond) // give loop() a chance to start waiting
+	time.Sleep(50 * time.Millisecond)
 
+	scope, _ := e.StartScope(context.Background())
 	var bgDone atomic.Bool
-	e.Go(func(context.Context) error {
+	scope.Go(func(context.Context) error {
 		time.Sleep(100 * time.Millisecond)
 		bgDone.Store(true)
 		return nil
 	})
-	e.handlerCompleted()
+	scope.End()
 
 	awaitPoll(t, api)
 	if !bgDone.Load() {
@@ -129,16 +132,17 @@ func TestExtension_ExtensionSeesInvokeBeforeHandlerCompletes(t *testing.T) {
 func TestExtension_MultipleInvocationsInSequence(t *testing.T) {
 	e, api := newTestExtension(t)
 
-	awaitPoll(t, api) // initial poll right after registration
+	awaitPoll(t, api)
 
 	for i := range 3 {
+		scope, _ := e.StartScope(context.Background())
 		var bgDone atomic.Bool
-		e.Go(func(context.Context) error {
+		scope.Go(func(context.Context) error {
 			time.Sleep(30 * time.Millisecond)
 			bgDone.Store(true)
 			return nil
 		})
-		e.handlerCompleted()
+		scope.End()
 		api.respond <- "INVOKE"
 
 		awaitPoll(t, api)
@@ -163,19 +167,18 @@ func TestExtension_ShutdownStopsPolling(t *testing.T) {
 	}
 }
 
-func TestExtensionFromContext_AvailableInsideWrappedHandler(t *testing.T) {
+func TestScopeFromContext_AvailableInsideWrappedHandler(t *testing.T) {
 	e, api := newTestExtension(t)
 	awaitPoll(t, api)
 
 	var bgDone atomic.Bool
+	var gotScope *Scope
 	handler := func(ctx context.Context) error {
-		got, ok := ExtensionFromContext(ctx)
+		got, ok := ScopeFromContext(ctx)
 		if !ok {
-			t.Error("ExtensionFromContext: Extension not found in handler's context")
+			t.Error("ScopeFromContext: Scope not found in handler's context")
 		}
-		if got != e {
-			t.Error("ExtensionFromContext: returned a different Extension than the one that wrapped the handler")
-		}
+		gotScope = got
 		return Go(ctx, func(context.Context) error {
 			time.Sleep(100 * time.Millisecond)
 			bgDone.Store(true)
@@ -187,6 +190,12 @@ func TestExtensionFromContext_AvailableInsideWrappedHandler(t *testing.T) {
 	if _, err := wrapped.Invoke(context.Background(), []byte("null")); err != nil {
 		t.Fatalf("Invoke() failed: %v", err)
 	}
+	if gotScope == nil {
+		t.Fatal("handler never observed a Scope")
+	}
+	if gotScope.root != nil {
+		t.Error("expected the Scope observed inside a Wrap()-ped handler to be a root Scope")
+	}
 
 	api.respond <- "INVOKE"
 	awaitPoll(t, api)
@@ -196,19 +205,20 @@ func TestExtensionFromContext_AvailableInsideWrappedHandler(t *testing.T) {
 	api.respond <- "SHUTDOWN"
 }
 
-func TestExtension_Go_PropagatesExtensionToNestedGo(t *testing.T) {
+func TestScope_Go_PropagatesToNestedGo(t *testing.T) {
 	e, api := newTestExtension(t)
 	awaitPoll(t, api)
 
+	scope, _ := e.StartScope(context.Background())
 	var nestedDone atomic.Bool
-	e.Go(func(bgCtx context.Context) error {
+	scope.Go(func(bgCtx context.Context) error {
 		return Go(bgCtx, func(context.Context) error {
 			time.Sleep(50 * time.Millisecond)
 			nestedDone.Store(true)
 			return nil
 		})
 	})
-	e.handlerCompleted()
+	scope.End()
 	api.respond <- "INVOKE"
 
 	awaitPoll(t, api)
@@ -218,16 +228,209 @@ func TestExtension_Go_PropagatesExtensionToNestedGo(t *testing.T) {
 	api.respond <- "SHUTDOWN"
 }
 
-func TestExtensionFromContext_NotFoundOutsideWrap(t *testing.T) {
-	if _, ok := ExtensionFromContext(context.Background()); ok {
-		t.Error("expected no Extension in a bare context.Background()")
+func TestScope_MultipleNestedScopes_OnlyRootEndSignalsCompletion(t *testing.T) {
+	e, api := newTestExtension(t)
+	awaitPoll(t, api)
+
+	scope1, ctx := e.StartScope(context.Background())
+
+	var done1, done2 atomic.Bool
+	scope1.Go(func(context.Context) error {
+		time.Sleep(30 * time.Millisecond)
+		done1.Store(true)
+		return nil
+	})
+
+	scope2, _ := e.StartScope(ctx)
+	scope2.Go(func(context.Context) error {
+		time.Sleep(60 * time.Millisecond)
+		done2.Store(true)
+		return nil
+	})
+	scope2.End()
+
+	scope1.End()
+
+	api.respond <- "INVOKE"
+	awaitPoll(t, api)
+	if !done1.Load() || !done2.Load() {
+		t.Error("loop() polled again before all Go tasks (root and nested scopes) finished")
+	}
+	api.respond <- "SHUTDOWN"
+}
+
+func TestScope_End_IsIdempotent(t *testing.T) {
+	e, api := newTestExtension(t)
+	awaitPoll(t, api)
+
+	scope, _ := e.StartScope(context.Background())
+	scope.End()
+	scope.End()
+
+	e.mu.Lock()
+	got := e.completions
+	e.mu.Unlock()
+	if got != 1 {
+		t.Errorf("completions = %d after calling End() twice on the same Scope, want 1", got)
+	}
+
+	api.respond <- "INVOKE"
+	awaitPoll(t, api)
+	api.respond <- "SHUTDOWN"
+}
+
+func TestScope_NestedEnd_IsNoOpEvenWhenCalledTwice(t *testing.T) {
+	e := newLocalTestExtension(t)
+
+	root, ctx := e.StartScope(context.Background())
+	nested, _ := e.StartScope(ctx)
+
+	nested.End()
+	nested.End()
+
+	var bgDone atomic.Bool
+	root.Go(func(context.Context) error {
+		bgDone.Store(true)
+		return nil
+	})
+	root.End()
+	e.waitInflight()
+
+	if !bgDone.Load() {
+		t.Error("root Scope's Go task did not finish")
 	}
 }
 
-func TestGo_ReturnsErrorWhenContextHasNoExtension(t *testing.T) {
+func TestScope_Go_TracksAgainstRootAcrossExtensions(t *testing.T) {
+	e1 := newLocalTestExtension(t)
+	e2 := newLocalTestExtension(t)
+
+	root, ctx := e1.StartScope(context.Background())
+	nested, _ := e2.StartScope(ctx)
+
+	var bgDone atomic.Bool
+	nested.Go(func(context.Context) error {
+		time.Sleep(50 * time.Millisecond)
+		bgDone.Store(true)
+		return nil
+	})
+	root.End()
+
+	if !bgDone.Load() {
+		t.Error("root.End() returned before the nested Scope's Go task (from a different Extension) finished")
+	}
+}
+
+func TestScopeFromContext_NotFoundOutsideWrap(t *testing.T) {
+	if _, ok := ScopeFromContext(context.Background()); ok {
+		t.Error("expected no Scope in a bare context.Background()")
+	}
+}
+
+func TestGo_ReturnsErrorWhenContextHasNoScope(t *testing.T) {
 	err := Go(context.Background(), func(context.Context) error { return nil })
-	if !errors.Is(err, ErrNoExtensionInContext) {
-		t.Errorf("Go() = %v, want ErrNoExtensionInContext", err)
+	if !errors.Is(err, ErrNoScopeInContext) {
+		t.Errorf("Go() = %v, want ErrNoScopeInContext", err)
+	}
+}
+
+func TestExtension_LoopWarnsWhenNoScopeStartedWithinTimeout(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	_, api := newTestExtension(t, WithScopeTimeout(50*time.Millisecond), WithLogger(logger))
+	awaitPoll(t, api)
+
+	api.respond <- "INVOKE"
+
+	awaitPoll(t, api)
+	if !strings.Contains(logBuf.String(), "no Scope was started") {
+		t.Errorf("expected a timeout warning to be logged, got: %s", logBuf.String())
+	}
+	api.respond <- "SHUTDOWN"
+}
+
+func TestExtension_LoopWithScopeTimeoutDisabled_WaitsIndefinitely(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	e, api := newTestExtension(t, WithScopeTimeout(0), WithLogger(logger))
+	awaitPoll(t, api)
+
+	api.respond <- "INVOKE"
+
+	time.Sleep(100 * time.Millisecond)
+
+	startedAt := time.Now()
+	scope, _ := e.StartScope(context.Background())
+	scope.End()
+
+	polledAt := awaitPoll(t, api)
+	if polledAt.Before(startedAt) {
+		t.Errorf("loop() issued /next at %s, before StartScope was called at %s", polledAt, startedAt)
+	}
+	if strings.Contains(logBuf.String(), "no Scope was started") {
+		t.Errorf("expected no timeout warning when WithScopeTimeout(0) disables it, got: %s", logBuf.String())
+	}
+	api.respond <- "SHUTDOWN"
+}
+
+func TestExtension_LoopDoesNotTimeOutOnSlowHandlerOnceScopeStarted(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	e, api := newTestExtension(t, WithScopeTimeout(50*time.Millisecond), WithLogger(logger))
+	awaitPoll(t, api)
+
+	scope, _ := e.StartScope(context.Background())
+	api.respond <- "INVOKE"
+
+	time.Sleep(150 * time.Millisecond) // handler takes longer than the 50ms scope timeout to call End
+	endedAt := time.Now()
+	scope.End()
+
+	polledAt := awaitPoll(t, api)
+	if polledAt.Before(endedAt) {
+		t.Errorf("loop() issued /next at %s, before End() was called at %s", polledAt, endedAt)
+	}
+	if strings.Contains(logBuf.String(), "no Scope was started") {
+		t.Errorf("expected no timeout warning once a Scope had started, got: %s", logBuf.String())
+	}
+	api.respond <- "SHUTDOWN"
+}
+
+func TestScope_Go_LogsErrorFromFn(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e := newLocalTestExtension(t, WithLogger(logger))
+
+	scope, _ := e.StartScope(context.Background())
+	scope.Go(func(context.Context) error {
+		return errors.New("boom")
+	})
+	e.waitInflight()
+
+	if !strings.Contains(logBuf.String(), "boom") {
+		t.Errorf("expected the background task error to be logged, got: %s", logBuf.String())
+	}
+}
+
+func TestExtension_LoopLogsErrorWhenNextFails(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	e := &Extension{
+		client:     http.DefaultClient,
+		runtimeAPI: "127.0.0.1:0",
+		rootCtx:    context.Background(),
+		logger:     logger,
+	}
+	e.cond = sync.NewCond(&e.mu)
+
+	e.loop()
+
+	if !strings.Contains(logBuf.String(), "event/next") {
+		t.Errorf("expected the extension failure to be logged, got: %s", logBuf.String())
 	}
 }
 
@@ -388,6 +591,40 @@ func TestExtension_LocalMode_InvokeWaitsForNestedGo(t *testing.T) {
 	}
 }
 
+func TestExtension_LocalMode_InvokeWaitsForNestedStartScope(t *testing.T) {
+	e := newLocalTestExtension(t)
+
+	var done1, done2 atomic.Bool
+	handler := func(ctx context.Context) error {
+		scope1, ok := ScopeFromContext(ctx)
+		if !ok {
+			t.Fatal("expected a Scope in the handler's context")
+		}
+		scope1.Go(func(context.Context) error {
+			time.Sleep(30 * time.Millisecond)
+			done1.Store(true)
+			return nil
+		})
+
+		scope2, _ := e.StartScope(ctx)
+		defer scope2.End()
+		scope2.Go(func(context.Context) error {
+			time.Sleep(60 * time.Millisecond)
+			done2.Store(true)
+			return nil
+		})
+		return nil
+	}
+
+	wrapped := e.Wrap(handler)
+	if _, err := wrapped.Invoke(context.Background(), []byte("null")); err != nil {
+		t.Fatalf("Invoke() failed: %v", err)
+	}
+	if !done1.Load() || !done2.Load() {
+		t.Error("Invoke() returned before all Go tasks (root and nested scopes) finished")
+	}
+}
+
 func TestExtension_LocalMode_InvokeWaitsEvenWhenHandlerPanics(t *testing.T) {
 	e := newLocalTestExtension(t)
 
@@ -433,7 +670,7 @@ func TestWrap_HandlerCompletedCalledEvenWhenHandlerPanics(t *testing.T) {
 	}
 
 	api.respond <- "INVOKE"
-	awaitPoll(t, api) // would time out if handlerCompleted() was skipped on panic
+	awaitPoll(t, api)
 	api.respond <- "SHUTDOWN"
 }
 
@@ -451,8 +688,9 @@ func TestWithExtensionName_OverridesRegisterHeader(t *testing.T) {
 func TestWithContext_DefaultsToBackground(t *testing.T) {
 	e := newLocalTestExtension(t)
 
+	scope, _ := e.StartScope(context.Background())
 	var gotCtx context.Context
-	e.Go(func(ctx context.Context) error {
+	scope.Go(func(ctx context.Context) error {
 		gotCtx = ctx
 		return nil
 	})
@@ -469,8 +707,9 @@ func TestWithContext_PropagatesValueToGo(t *testing.T) {
 	rootCtx := context.WithValue(context.Background(), testCtxKey{}, "root-value")
 	e := newLocalTestExtension(t, WithContext(rootCtx))
 
+	scope, _ := e.StartScope(context.Background())
 	var got any
-	e.Go(func(ctx context.Context) error {
+	scope.Go(func(ctx context.Context) error {
 		got = ctx.Value(testCtxKey{})
 		return nil
 	})
@@ -485,8 +724,9 @@ func TestWithContext_CancelPropagatesToGo(t *testing.T) {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	e := newLocalTestExtension(t, WithContext(rootCtx))
 
+	scope, _ := e.StartScope(context.Background())
 	done := make(chan struct{})
-	e.Go(func(ctx context.Context) error {
+	scope.Go(func(ctx context.Context) error {
 		<-ctx.Done()
 		close(done)
 		return nil

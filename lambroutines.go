@@ -2,8 +2,9 @@
 // Go, with the same start-immediately semantics as a plain go statement,
 // while guaranteeing that work finishes before the execution environment is
 // allowed to freeze. It does this by registering an internal Lambda
-// extension that defers the extension's own /next call until the handler
-// has returned and all work started via Go has completed.
+// extension that defers the extension's own /next call until a Scope opened
+// for the invocation has ended and all work started via that Scope's Go has
+// completed.
 //
 // Off the Lambda runtime (see OnLambdaRuntime) — for example under
 // fujiwara/lamblocal, or a plain `go run` — there is no Extensions API to
@@ -19,17 +20,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
 const (
 	defaultExtensionName      = "lambroutines"
+	defaultScopeTimeout       = 30 * time.Second
 	eventTypeInvoke           = "INVOKE"
 	extensionIdentifierHeader = "Lambda-Extension-Identifier"
 )
@@ -44,22 +47,24 @@ func OnLambdaRuntime() bool {
 }
 
 // Extension is a Lambda internal extension: it delays the execution
-// environment freeze until background work started via Go has finished, by
-// deferring its own /next call until the handler has returned and that work
-// has completed. It also tracks that work, similar in spirit to
-// golang.org/x/sync/errgroup.Group. The zero value is not usable; create one
-// with Start.
+// environment freeze until background work started via a Scope's Go has
+// finished, by deferring its own /next call until a Scope opened for the
+// invocation has ended and that work has completed. The zero value is not
+// usable; create one with Start.
 type Extension struct {
 	client        *http.Client
 	runtimeAPI    string
 	local         bool
 	rootCtx       context.Context
 	extensionName string
+	scopeTimeout  time.Duration
+	logger        *slog.Logger
 
 	mu          sync.Mutex
 	cond        *sync.Cond
-	inflight    int
+	starts      int
 	completions int
+	inflight    int
 
 	extensionID string
 }
@@ -70,8 +75,11 @@ type Option func(*Extension)
 // WithContext sets the root context.Context used as the base for the
 // context passed to fn by Go and, on the Lambda runtime, for the requests
 // this Extension makes to the Lambda Extensions API. It defaults to
-// context.Background(). Canceling the provided context stops the polling
-// loop and is propagated to fn.
+// context.Background(). Canceling the provided context is propagated to fn
+// and stops the extension's own /next request from blocking indefinitely;
+// it is not observed while the polling loop is waiting for a Scope to start
+// or end, or for in-flight Go work to finish, so canceling it does not by
+// itself unblock those waits.
 func WithContext(ctx context.Context) Option {
 	return func(e *Extension) {
 		e.rootCtx = ctx
@@ -86,11 +94,40 @@ func WithExtensionName(name string) Option {
 	}
 }
 
+// WithScopeTimeout overrides how long, on the Lambda runtime, the extension
+// waits for a Scope to be started (see (*Extension).StartScope) after
+// receiving an INVOKE event before giving up and logging a warning. It
+// defaults to 30 seconds. A value <= 0 disables the timeout, and the
+// extension waits indefinitely instead.
+//
+// This guards against forgetting to wrap the handler with Wrap or call
+// StartScope: without it, a missing Scope would make the extension's
+// polling loop wait forever. It does not protect against a Scope started
+// later than this timeout (see StartScope for the guidance to start Scopes
+// as early as possible), nor against invocations that never start a Scope
+// at all (for example, requests routed to handlers that don't call
+// StartScope), which pay the timeout on every such invocation.
+func WithScopeTimeout(d time.Duration) Option {
+	return func(e *Extension) {
+		e.scopeTimeout = d
+	}
+}
+
+// WithLogger overrides the *slog.Logger used to report background task
+// errors, extension failures, and scope-timeout warnings. It defaults to
+// slog.Default().
+func WithLogger(logger *slog.Logger) Option {
+	return func(e *Extension) {
+		e.logger = logger
+	}
+}
+
 // Start creates an Extension and, on the Lambda runtime (see
 // OnLambdaRuntime), registers it with the Lambda Extensions API and starts
 // the background loop that keeps the execution environment from freezing
-// until the handler has returned and all in-flight work started via Go has
-// finished. Start blocks until registration completes.
+// until a Scope started for the invocation has ended and all its in-flight
+// work started via Go has finished. Start blocks until registration
+// completes.
 //
 // Off the Lambda runtime, such as under fujiwara/lamblocal or a plain
 // `go run`, the returned Extension runs in local mode instead: Start does
@@ -104,6 +141,8 @@ func Start(opts ...Option) (*Extension, error) {
 		local:         !OnLambdaRuntime(),
 		rootCtx:       context.Background(),
 		extensionName: defaultExtensionName,
+		scopeTimeout:  defaultScopeTimeout,
+		logger:        slog.Default(),
 	}
 	e.cond = sync.NewCond(&e.mu)
 	for _, opt := range opts {
@@ -123,18 +162,82 @@ func Start(opts ...Option) (*Extension, error) {
 	return e, nil
 }
 
-// Go runs fn in a new goroutine, starting immediately just like a plain go
-// statement, but tracks it so completion can be waited for: on the Lambda
-// runtime, e's polling loop (started by Start) delays freezing the
-// execution environment until fn returns; in local mode, the handler wrapped
-// with Wrap waits for fn before Invoke returns. If fn returns a non-nil
-// error, the error is logged.
+// Scope represents the span of a single Lambda invocation — or an
+// http.Handler request, or any other unit of work in which background tasks
+// should be tracked. Background work started via Go while a Scope is active
+// is guaranteed to finish before the execution environment freezes. Create
+// one with (*Extension).StartScope; the zero value is not usable.
 //
-// Go must be called synchronously from the handler's own call stack (or from
-// a running fn, to launch further work). Calling it from an unrelated
-// goroutine started by the handler is not tracked reliably: the handler may
-// be observed as complete before that goroutine's Go call registers.
-func (e *Extension) Go(fn func(context.Context) error) {
+// A Scope started while ctx already carries another Scope (for example,
+// nested StartScope calls, or a call from inside a Go fn) is a nested Scope:
+// its Go calls are tracked against the outermost (root) Scope, and its End
+// is a no-op — only the root Scope's End signals completion. This lets code
+// call StartScope defensively without needing to know whether it's already
+// inside one.
+type Scope struct {
+	extension *Extension
+	root      *Scope
+	endOnce   sync.Once
+}
+
+func (s *Scope) rootOrSelf() *Scope {
+	if s.root != nil {
+		return s.root
+	}
+	return s
+}
+
+// StartScope opens a Scope for the current invocation and embeds it in the
+// returned context.Context, retrievable via ScopeFromContext. Call End
+// (typically via defer) when the invocation is done.
+//
+// Wrap calls StartScope automatically; call it directly only when you can't
+// use Wrap, for example when adapting a handler shape Wrap doesn't cover
+// (such as fujiwara/ridge's http.Handler-based integration). Call
+// StartScope as early as possible in the invocation — ideally as the first
+// statement — and always pair it with a deferred End. On the Lambda
+// runtime, the extension only waits up to WithScopeTimeout for some Scope to
+// start after each INVOKE event; starting one later than that risks it
+// being attributed to the wrong invocation, silently breaking the
+// freeze-delay guarantee (see WithScopeTimeout).
+//
+// Call it at most once per invocation with a ctx that doesn't already carry
+// a Scope. A second such call within the same invocation starts an
+// unrelated root Scope that the extension's polling loop isn't guaranteed to
+// wait for; pass the ctx returned by the first call (directly, or via a
+// nested call to StartScope) instead.
+func (e *Extension) StartScope(ctx context.Context) (*Scope, context.Context) {
+	if parent, ok := ScopeFromContext(ctx); ok {
+		nested := &Scope{extension: e, root: parent.rootOrSelf()}
+		return nested, context.WithValue(ctx, scopeContextKey{}, nested)
+	}
+
+	e.mu.Lock()
+	e.starts++
+	e.cond.Broadcast()
+	e.mu.Unlock()
+
+	root := &Scope{extension: e}
+	return root, context.WithValue(ctx, scopeContextKey{}, root)
+}
+
+// Go runs fn in a new goroutine, starting immediately just like a plain go
+// statement, but tracks it against s's root Scope so completion can be
+// waited for: on the Lambda runtime, the extension's polling loop delays
+// freezing the execution environment until fn returns; in local mode, the
+// code that calls End on the root Scope waits for fn before returning. If fn
+// returns a non-nil error, the error is logged.
+//
+// Go must be called synchronously from the scope holder's own call stack (or
+// from a running fn, to launch further work). Calling it from an unrelated
+// goroutine is not tracked reliably: the root Scope's End may be observed
+// before that goroutine's Go call registers.
+//
+// fn must not call End on the Scope it receives via bgCtx (or on any
+// ancestor of that Scope): in local mode, End waits for this same Go call to
+// finish, so calling it from inside fn deadlocks.
+func (s *Scope) Go(fn func(context.Context) error) {
+	e := s.rootOrSelf().extension
 	e.mu.Lock()
 	e.inflight++
 	e.mu.Unlock()
@@ -148,30 +251,56 @@ func (e *Extension) Go(fn func(context.Context) error) {
 			}
 			e.mu.Unlock()
 		}()
-		bgCtx := context.WithValue(e.rootCtx, extensionContextKey{}, e)
+		bgCtx := context.WithValue(e.rootCtx, scopeContextKey{}, s)
 		if err := fn(bgCtx); err != nil {
-			log.Printf("lambroutines: background task returned error: %v", err)
+			e.logger.Error("lambroutines: background task returned error", "error", err)
 		}
 	}()
 }
 
-// Wrap adapts handler, in any form accepted by lambda.Start, so that its
-// completion is signaled to e and e becomes retrievable from the handler's
-// context via ExtensionFromContext (and, through it, Go). The returned
-// Handler must be passed to lambda.Start (or lambda.StartWithOptions) in
-// place of handler. Because the returned Handler already satisfies the
-// lambda.Handler interface, lambda's JSON-decoding Options (WithUseNumber,
-// WithDisallowUnknownFields, WithSetEscapeHTML, WithSetIndent) are bypassed if
-// passed alongside it; apply them to handler via lambda.NewHandlerWithOptions
-// before calling Wrap if needed.
+// End marks s as finished. For a root Scope (one returned by StartScope when
+// ctx carried no other Scope), this signals the extension that the
+// invocation is done, and in local mode blocks until all work started via Go
+// against this Scope has finished. For a nested Scope, End is a no-op — only
+// the root Scope's End matters.
 //
-// In local mode, the returned Handler's Invoke waits for e's in-flight work
-// to finish before returning, using the same inflight count that Go tracks.
-// This assumes at most one invocation is in flight on e at a time, matching
-// how a single Lambda execution environment (and thus a single Extension)
-// actually operates; calling Invoke concurrently on Handlers sharing the
-// same Extension is not supported and will make one invocation wait on
-// another's unrelated background work.
+// End is idempotent: calling it more than once on the same root Scope has no
+// effect beyond the first call. In local mode, a second, concurrent call
+// blocks until the first call's wait for in-flight work has finished; it
+// does not return immediately.
+//
+// End must not be called from inside a fn passed to this Scope's (or one of
+// its descendants') Go: see Go's documentation for why that deadlocks in
+// local mode.
+func (s *Scope) End() {
+	if s.root != nil {
+		return
+	}
+	s.endOnce.Do(func() {
+		s.extension.noteScopeEnded()
+		if s.extension.local {
+			s.extension.waitInflight()
+		}
+	})
+}
+
+// Wrap adapts handler, in any form accepted by lambda.Start, so that a Scope
+// is started for each invocation and embedded in the handler's context via
+// ScopeFromContext (and, through it, Go), and the Scope is ended once
+// handler returns. The returned Handler must be passed to lambda.Start (or
+// lambda.StartWithOptions) in place of handler. Because the returned Handler
+// already satisfies the lambda.Handler interface, lambda's JSON-decoding
+// Options (WithUseNumber, WithDisallowUnknownFields, WithSetEscapeHTML,
+// WithSetIndent) are bypassed if passed alongside it; apply them to handler
+// via lambda.NewHandlerWithOptions before calling Wrap if needed.
+//
+// In local mode, the returned Handler's Invoke waits for the Scope's
+// in-flight work to finish before returning. This assumes at most one
+// invocation is in flight on e at a time, matching how a single Lambda
+// execution environment (and thus a single Extension) actually operates;
+// calling Invoke concurrently on Handlers sharing the same Extension is not
+// supported and will make one invocation wait on another's unrelated
+// background work.
 func (e *Extension) Wrap(handler any) lambda.Handler {
 	return &wrappedHandler{extension: e, inner: lambda.NewHandler(handler)}
 }
@@ -182,46 +311,39 @@ type wrappedHandler struct {
 }
 
 func (w *wrappedHandler) Invoke(ctx context.Context, payload []byte) ([]byte, error) {
-	defer func() {
-		w.extension.handlerCompleted()
-		if w.extension.local {
-			w.extension.waitInflight()
-		}
-	}()
-	return w.inner.Invoke(context.WithValue(ctx, extensionContextKey{}, w.extension), payload)
+	scope, ctx := w.extension.StartScope(ctx)
+	defer scope.End()
+	return w.inner.Invoke(ctx, payload)
 }
 
-type extensionContextKey struct{}
+type scopeContextKey struct{}
 
-// ExtensionFromContext returns the Extension embedded in ctx by
-// (*Extension).Wrap, and reports whether one was found.
-func ExtensionFromContext(ctx context.Context) (*Extension, bool) {
-	e, ok := ctx.Value(extensionContextKey{}).(*Extension)
-	return e, ok
+// ScopeFromContext returns the Scope embedded in ctx by
+// (*Extension).StartScope (including via Wrap), and reports whether one was
+// found.
+func ScopeFromContext(ctx context.Context) (*Scope, bool) {
+	s, ok := ctx.Value(scopeContextKey{}).(*Scope)
+	return s, ok
 }
 
-// ErrNoExtensionInContext is returned by Go when ctx was not derived from a
-// handler wrapped with (*Extension).Wrap.
-var ErrNoExtensionInContext = errors.New("lambroutines: no Extension in context; handler must be wrapped with (*Extension).Wrap")
+// ErrNoScopeInContext is returned by Go when ctx was not derived from a
+// Scope started by (*Extension).StartScope.
+var ErrNoScopeInContext = errors.New("lambroutines: no Scope in context; call (*Extension).StartScope (or wrap the handler with (*Extension).Wrap)")
 
-// Go is a convenience wrapper around (*Extension).Go for handlers wrapped
-// with (*Extension).Wrap: it looks up the Extension via
-// ExtensionFromContext(ctx) and calls Go on it, so the handler doesn't need
-// to hold onto the Extension itself. It returns ErrNoExtensionInContext if
-// ctx was not derived from a handler wrapped with (*Extension).Wrap.
+// Go is a convenience wrapper around (*Scope).Go for code holding only a
+// context.Context: it looks up the Scope via ScopeFromContext(ctx) and calls
+// Go on it. It returns ErrNoScopeInContext if ctx was not derived from a
+// Scope started by (*Extension).StartScope.
 func Go(ctx context.Context, fn func(context.Context) error) error {
-	e, ok := ExtensionFromContext(ctx)
+	s, ok := ScopeFromContext(ctx)
 	if !ok {
-		return ErrNoExtensionInContext
+		return ErrNoScopeInContext
 	}
-	e.Go(fn)
+	s.Go(fn)
 	return nil
 }
 
-// handlerCompleted records that the handler for the current invocation has
-// returned. In non-local mode, loop waits for this before checking inflight;
-// in local mode nothing reads completions, so this is a harmless no-op signal.
-func (e *Extension) handlerCompleted() {
+func (e *Extension) noteScopeEnded() {
 	e.mu.Lock()
 	e.completions++
 	e.cond.Broadcast()
@@ -229,29 +351,64 @@ func (e *Extension) handlerCompleted() {
 }
 
 func (e *Extension) loop() {
-	consumed := 0
+	consumedStarts := 0
+	consumedCompletions := 0
 	for {
 		eventType, err := e.next(e.rootCtx)
 		if err != nil {
-			log.Printf("lambroutines: extension event/next failed, stopping: %v", err)
+			e.logger.Error("lambroutines: extension event/next failed, stopping", "error", err)
 			return
 		}
 		if eventType != eventTypeInvoke {
 			return
 		}
 
-		e.mu.Lock()
-		for e.completions == consumed {
-			e.cond.Wait()
+		newStarts, started := e.waitForStart(consumedStarts)
+		if !started {
+			e.logger.Warn("lambroutines: no Scope was started within the timeout; did you forget to call StartScope or wrap the handler with Wrap?")
+			continue
 		}
-		consumed = e.completions
-		e.mu.Unlock()
+		consumedStarts = newStarts
 
+		consumedCompletions = e.waitForCompletion(consumedCompletions)
 		e.waitInflight()
 	}
 }
 
-// waitInflight blocks until all work started via Go has finished.
+func (e *Extension) waitForStart(consumed int) (int, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.scopeTimeout <= 0 {
+		for e.starts == consumed {
+			e.cond.Wait()
+		}
+		return e.starts, true
+	}
+
+	deadline := time.Now().Add(e.scopeTimeout)
+	timer := time.AfterFunc(e.scopeTimeout, func() {
+		e.mu.Lock()
+		e.cond.Broadcast()
+		e.mu.Unlock()
+	})
+	defer timer.Stop()
+
+	for e.starts == consumed && time.Now().Before(deadline) {
+		e.cond.Wait()
+	}
+	return e.starts, e.starts != consumed
+}
+
+func (e *Extension) waitForCompletion(consumed int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for e.completions == consumed {
+		e.cond.Wait()
+	}
+	return e.completions
+}
+
 func (e *Extension) waitInflight() {
 	e.mu.Lock()
 	for e.inflight > 0 {
@@ -284,7 +441,7 @@ func (e *Extension) register(ctx context.Context) error {
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			log.Printf("lambroutines: close register response body: %v", err)
+			e.logger.Error("lambroutines: close register response body", "error", err)
 		}
 	}()
 
@@ -317,7 +474,7 @@ func (e *Extension) next(ctx context.Context) (string, error) {
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			log.Printf("lambroutines: close event/next response body: %v", err)
+			e.logger.Error("lambroutines: close event/next response body", "error", err)
 		}
 	}()
 
