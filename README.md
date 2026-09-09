@@ -144,8 +144,16 @@ Extensions API's freeze-deferral behavior.
   this timeout, nor against invocations that never start a `Scope`, which
   pay the timeout on every such invocation.
 - `lambroutines.WithLogger(logger)` overrides the `*slog.Logger` used to
-  report background task errors, extension failures, and scope-timeout
-  warnings (defaults to `slog.Default()`).
+  report extension failures and scope-timeout warnings (defaults to
+  `slog.Default()`). The default `BackgroundErrorHandler` (see
+  `WithErrorHandler`) also reports through this logger unless
+  `WithErrorHandler` overrides it.
+- `lambroutines.WithErrorHandler(h)` overrides how `Go` reports a failure
+  from `fn`: a returned non-nil error, or a recovered panic wrapped in
+  `*PanicError`. Defaults to logging via the logger from `WithLogger`. A
+  panic from `fn` is always recovered before reaching this handler, so by
+  default a panicking background task no longer crashes the process; panic
+  again from within `h` to restore that behavior.
 
 ## License
 

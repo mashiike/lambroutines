@@ -415,6 +415,118 @@ func TestScope_Go_LogsErrorFromFn(t *testing.T) {
 	}
 }
 
+func TestScope_Go_RecoversPanicFromFn(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	e := newLocalTestExtension(t, WithLogger(logger))
+
+	scope, _ := e.StartScope(context.Background())
+	scope.Go(func(context.Context) error {
+		panic("boom")
+	})
+	e.waitInflight() // crashes the test process if the panic isn't recovered
+
+	if !strings.Contains(logBuf.String(), "panic: boom") {
+		t.Errorf("expected the recovered panic to be logged via PanicError.Error(), got: %s", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "stack=") {
+		t.Errorf("expected the panic's stack trace to be logged, got: %s", logBuf.String())
+	}
+}
+
+func TestScope_Go_WithErrorHandler_ReceivesReturnedErrorAndPanic(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	var mu sync.Mutex
+	var got []error
+	e := newLocalTestExtension(t, WithLogger(logger), WithErrorHandler(func(ctx context.Context, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, err)
+	}))
+
+	scope, _ := e.StartScope(context.Background())
+	scope.Go(func(context.Context) error {
+		return errors.New("returned-error")
+	})
+	scope.Go(func(context.Context) error {
+		panic("panicked")
+	})
+	e.waitInflight()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("expected the custom handler to be called twice, got %d calls: %v", len(got), got)
+	}
+
+	var panicErr *PanicError
+	var sawReturnedError, sawPanic bool
+	for _, err := range got {
+		switch {
+		case errors.As(err, &panicErr):
+			sawPanic = true
+			if panicErr.Recovered != "panicked" {
+				t.Errorf("PanicError.Recovered = %v, want %q", panicErr.Recovered, "panicked")
+			}
+			if len(panicErr.Stack) == 0 {
+				t.Error("expected PanicError.Stack to be non-empty")
+			}
+		case err.Error() == "returned-error":
+			sawReturnedError = true
+		}
+	}
+	if !sawReturnedError || !sawPanic {
+		t.Errorf("expected both a returned error and a PanicError, got: %v", got)
+	}
+
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no default logging once WithErrorHandler is set, got: %s", logBuf.String())
+	}
+}
+
+func TestExtension_LambdaMode_NextPollWaitsForErrorHandler(t *testing.T) {
+	var handlerDone atomic.Bool
+	e, api := newTestExtension(t, WithErrorHandler(func(context.Context, error) {
+		time.Sleep(100 * time.Millisecond)
+		handlerDone.Store(true)
+	}))
+	awaitPoll(t, api)
+
+	scope, _ := e.StartScope(context.Background())
+	scope.Go(func(context.Context) error {
+		panic("boom")
+	})
+	scope.End()
+
+	api.respond <- "INVOKE"
+
+	awaitPoll(t, api)
+	if !handlerDone.Load() {
+		t.Error("loop() polled again before the BackgroundErrorHandler had finished running")
+	}
+	api.respond <- "SHUTDOWN"
+}
+
+func TestPanicError_Unwrap(t *testing.T) {
+	t.Run("recovered value is an error", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New("inner")
+		pe := &PanicError{Recovered: inner}
+		if got := pe.Unwrap(); got != inner {
+			t.Errorf("Unwrap() = %v, want %v", got, inner)
+		}
+	})
+	t.Run("recovered value is not an error", func(t *testing.T) {
+		t.Parallel()
+		pe := &PanicError{Recovered: "boom"}
+		if got := pe.Unwrap(); got != nil {
+			t.Errorf("Unwrap() = %v, want nil", got)
+		}
+	})
+}
+
 func TestExtension_LoopLogsErrorWhenNextFails(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))

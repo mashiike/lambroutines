@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,8 @@ type Extension struct {
 	extensionName string
 	scopeTimeout  time.Duration
 	logger        *slog.Logger
+
+	errorHandler BackgroundErrorHandler
 
 	mu          sync.Mutex
 	cond        *sync.Cond
@@ -113,13 +116,68 @@ func WithScopeTimeout(d time.Duration) Option {
 	}
 }
 
-// WithLogger overrides the *slog.Logger used to report background task
-// errors, extension failures, and scope-timeout warnings. It defaults to
-// slog.Default().
+// WithLogger overrides the *slog.Logger used to report extension failures
+// and scope-timeout warnings. It defaults to slog.Default(). The default
+// BackgroundErrorHandler (see WithErrorHandler) also reports through this
+// logger unless WithErrorHandler overrides it.
 func WithLogger(logger *slog.Logger) Option {
 	return func(e *Extension) {
 		e.logger = logger
 	}
+}
+
+// BackgroundErrorHandler is called by Go exactly once when fn returns a
+// non-nil error or panics. err is either the error fn returned, or a
+// *PanicError wrapping the recovered panic value. ctx is the same context
+// fn received; as with fn, the handler must not call End on the Scope it
+// carries (or on any ancestor of that Scope), which would deadlock in local
+// mode.
+//
+// If the handler itself panics, that panic is not recovered a second time:
+// it propagates out of the goroutine started by Go, crashing the process,
+// regardless of whether err was a returned error or a *PanicError. See
+// WithErrorHandler for using this to restore crash-on-panic behavior.
+//
+// The handler runs before the failed Go call is considered finished: on the
+// Lambda runtime it delays the extension's /next call, and in local mode it
+// delays End, for as long as the handler takes. It may also be called
+// concurrently from multiple goroutines if more than one Go call fails at
+// around the same time, so it must be safe for concurrent use.
+type BackgroundErrorHandler func(ctx context.Context, err error)
+
+// WithErrorHandler overrides how Go reports a failure from fn: a returned
+// non-nil error, or a recovered panic wrapped in *PanicError. It defaults to
+// logging err via the *slog.Logger configured with WithLogger.
+//
+// A panic from fn is always recovered before reaching this handler (see Go),
+// so by default a panicking background task no longer crashes the process.
+// To restore that behavior for panics specifically, check for a *PanicError
+// with errors.As and panic again from within h.
+func WithErrorHandler(h BackgroundErrorHandler) Option {
+	return func(e *Extension) {
+		e.errorHandler = h
+	}
+}
+
+// PanicError wraps a value recovered from a panic in background work started
+// via (*Scope).Go, together with the stack trace captured at the point of
+// the panic. If the recovered value implements error, Unwrap returns it.
+type PanicError struct {
+	Recovered any
+	Stack     []byte
+}
+
+// Error implements the error interface, formatting Recovered.
+func (e *PanicError) Error() string {
+	return fmt.Sprintf("panic: %v", e.Recovered)
+}
+
+// Unwrap returns Recovered if it implements error, and nil otherwise.
+func (e *PanicError) Unwrap() error {
+	if err, ok := e.Recovered.(error); ok {
+		return err
+	}
+	return nil
 }
 
 // Start creates an Extension and, on the Lambda runtime (see
@@ -147,6 +205,16 @@ func Start(opts ...Option) (*Extension, error) {
 	e.cond = sync.NewCond(&e.mu)
 	for _, opt := range opts {
 		opt(e)
+	}
+	if e.errorHandler == nil {
+		e.errorHandler = func(ctx context.Context, err error) {
+			var panicErr *PanicError
+			if errors.As(err, &panicErr) {
+				e.logger.ErrorContext(ctx, "lambroutines: background task failed", "error", err, "stack", string(panicErr.Stack))
+				return
+			}
+			e.logger.ErrorContext(ctx, "lambroutines: background task failed", "error", err)
+		}
 	}
 
 	if e.local {
@@ -226,7 +294,11 @@ func (e *Extension) StartScope(ctx context.Context) (*Scope, context.Context) {
 // waited for: on the Lambda runtime, the extension's polling loop delays
 // freezing the execution environment until fn returns; in local mode, the
 // code that calls End on the root Scope waits for fn before returning. If fn
-// returns a non-nil error, the error is logged.
+// returns a non-nil error, or panics, the failure is recovered and passed to
+// the Extension's BackgroundErrorHandler (see WithErrorHandler); by default,
+// that logs it and, in the panic case, does not crash the process. To
+// restore the crash-on-panic behavior, panic again from a custom handler
+// installed with WithErrorHandler.
 //
 // Go must be called synchronously from the scope holder's own call stack (or
 // from a running fn, to launch further work). Calling it from an unrelated
@@ -235,7 +307,8 @@ func (e *Extension) StartScope(ctx context.Context) (*Scope, context.Context) {
 //
 // fn must not call End on the Scope it receives via bgCtx (or on any
 // ancestor of that Scope): in local mode, End waits for this same Go call to
-// finish, so calling it from inside fn deadlocks.
+// finish, so calling it from inside fn (or from a BackgroundErrorHandler
+// invoked for it) deadlocks.
 func (s *Scope) Go(fn func(context.Context) error) {
 	e := s.rootOrSelf().extension
 	e.mu.Lock()
@@ -252,8 +325,16 @@ func (s *Scope) Go(fn func(context.Context) error) {
 			e.mu.Unlock()
 		}()
 		bgCtx := context.WithValue(e.rootCtx, scopeContextKey{}, s)
-		if err := fn(bgCtx); err != nil {
-			e.logger.Error("lambroutines: background task returned error", "error", err)
+		err := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = &PanicError{Recovered: r, Stack: debug.Stack()}
+				}
+			}()
+			return fn(bgCtx)
+		}()
+		if err != nil {
+			e.errorHandler(bgCtx, err)
 		}
 	}()
 }

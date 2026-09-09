@@ -98,7 +98,8 @@ Lambda 実行環境外(`lambroutines.OnLambdaRuntime` を参照)——例えば 
 - `lambroutines.WithContext(ctx)`: `Go` が `fn` に渡す context のベースとなる root context、および Extension 自身の Extensions API リクエストに使う context を設定します。キャンセルするとポーリングループが停止し、`fn` にも伝播します。
 - `lambroutines.WithExtensionName(name)`: Extension が Lambda Extensions API に登録する名前を上書きします(デフォルトは `"lambroutines"`)。
 - `lambroutines.WithScopeTimeout(d)`: Lambda 実行環境上で、`INVOKE` イベントを受け取ってから `Scope` が開始される(`StartScope` 参照)のを待つ時間を上書きします(デフォルトは30秒、`d <= 0` でタイムアウトを無効化)。これが防ぐのは「`Scope` が一度も開始されない」ケース(例: handler を `Wrap` し忘れる)だけです。タイムアウトより遅れて `Scope` を開始するケースは保護されません。また `Scope` を一度も開始しない invocation(該当する handler へのリクエストごと)は毎回このタイムアウト分だけ待たされます。
-- `lambroutines.WithLogger(logger)`: バックグラウンド処理のエラー・extension の失敗・scope タイムアウトの警告を出力する `*slog.Logger` を上書きします(デフォルトは `slog.Default()`)。
+- `lambroutines.WithLogger(logger)`: extension の失敗・scope タイムアウトの警告を出力する `*slog.Logger` を上書きします(デフォルトは `slog.Default()`)。デフォルトの `BackgroundErrorHandler`(`WithErrorHandler` 参照)も、`WithErrorHandler` で上書きされない限りこの logger を使って報告します。
+- `lambroutines.WithErrorHandler(h)`: `Go` が `fn` の失敗——返された非 nil の error、または recover された panic を包む `*PanicError`——をどう報告するかを上書きします。デフォルトは `WithLogger` の logger へのログ出力です。`fn` の panic はこの handler に届く前に必ず recover されるため、デフォルトでは panic した background task がプロセスをクラッシュさせなくなります。この挙動を復元したい場合は `h` の中で再度 panic してください。
 
 ## ライセンス
 
